@@ -1,5 +1,6 @@
 
 #include <linux/log2.h>
+#include <linux/osq_optimistic_spin.h>
 #include <linux/preempt.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
@@ -146,127 +147,26 @@ struct six_lock_waiter {
 /* This is probably up there with the more evil things I've done */
 #define waitlist_bitnr(id) ilog2((((union six_lock_state) { .waiters = 1 << (id) }).l))
 
-#ifdef CONFIG_LOCK_SPIN_ON_OWNER
-
-static inline int six_can_spin_on_owner(struct six_lock *lock)
+static inline struct task_struct *six_osq_get_owner(struct optimistic_spin_queue *osq)
 {
-	struct task_struct *owner;
-	int retval = 1;
+	struct six_lock *lock = container_of(osq, struct six_lock, osq);
 
-	if (need_resched())
-		return 0;
-
-	rcu_read_lock();
-	owner = READ_ONCE(lock->owner);
-	if (owner)
-		retval = owner->on_cpu;
-	rcu_read_unlock();
-	/*
-	 * if lock->owner is not set, the mutex owner may have just acquired
-	 * it and not set the owner yet or the mutex has been released.
-	 */
-	return retval;
+	return lock->owner;
 }
 
-static inline bool six_spin_on_owner(struct six_lock *lock,
-				     struct task_struct *owner)
+static inline bool six_osq_trylock_read(struct optimistic_spin_queue *osq)
 {
-	bool ret = true;
+	struct six_lock *lock = container_of(osq, struct six_lock, osq);
 
-	rcu_read_lock();
-	while (lock->owner == owner) {
-		/*
-		 * Ensure we emit the owner->on_cpu, dereference _after_
-		 * checking lock->owner still matches owner. If that fails,
-		 * owner might point to freed memory. If it still matches,
-		 * the rcu_read_lock() ensures the memory stays valid.
-		 */
-		barrier();
-
-		if (!owner->on_cpu || need_resched()) {
-			ret = false;
-			break;
-		}
-
-		cpu_relax();
-	}
-	rcu_read_unlock();
-
-	return ret;
+	return do_six_trylock_type(lock, SIX_LOCK_read);
 }
 
-static inline bool six_optimistic_spin(struct six_lock *lock, enum six_lock_type type)
+static inline bool six_osq_trylock_intent(struct optimistic_spin_queue *osq)
 {
-	struct task_struct *task = current;
+	struct six_lock *lock = container_of(osq, struct six_lock, osq);
 
-	if (type == SIX_LOCK_write)
-		return false;
-
-	preempt_disable();
-	if (!six_can_spin_on_owner(lock))
-		goto fail;
-
-	if (!osq_lock(&lock->osq))
-		goto fail;
-
-	while (1) {
-		struct task_struct *owner;
-
-		/*
-		 * If there's an owner, wait for it to either
-		 * release the lock or go to sleep.
-		 */
-		owner = READ_ONCE(lock->owner);
-		if (owner && !six_spin_on_owner(lock, owner))
-			break;
-
-		if (do_six_trylock_type(lock, type)) {
-			osq_unlock(&lock->osq);
-			preempt_enable();
-			return true;
-		}
-
-		/*
-		 * When there's no owner, we might have preempted between the
-		 * owner acquiring the lock and setting the owner field. If
-		 * we're an RT task that will live-lock because we won't let
-		 * the owner complete.
-		 */
-		if (!owner && (need_resched() || rt_task(task)))
-			break;
-
-		/*
-		 * The cpu_relax() call is a compiler barrier which forces
-		 * everything in this loop to be re-loaded. We don't need
-		 * memory barriers as we'll eventually observe the right
-		 * values at the cost of a few extra spins.
-		 */
-		cpu_relax();
-	}
-
-	osq_unlock(&lock->osq);
-fail:
-	preempt_enable();
-
-	/*
-	 * If we fell out of the spin path because of need_resched(),
-	 * reschedule now, before we try-lock again. This avoids getting
-	 * scheduled out right after we obtained the lock.
-	 */
-	if (need_resched())
-		schedule();
-
-	return false;
+	return do_six_trylock_type(lock, SIX_LOCK_intent);
 }
-
-#else /* CONFIG_LOCK_SPIN_ON_OWNER */
-
-static inline bool six_optimistic_spin(struct six_lock *lock, enum six_lock_type type)
-{
-	return false;
-}
-
-#endif
 
 noinline
 static void __six_lock_type_slowpath(struct six_lock *lock, enum six_lock_type type)
@@ -276,8 +176,20 @@ static void __six_lock_type_slowpath(struct six_lock *lock, enum six_lock_type t
 	struct six_lock_waiter wait;
 	u64 v;
 
-	if (six_optimistic_spin(lock, type))
-		return;
+	switch (type) {
+	case SIX_LOCK_read:
+		if (osq_optimistic_spin(&lock->osq, six_osq_get_owner,
+					six_osq_trylock_read))
+			return;
+		break;
+	case SIX_LOCK_intent:
+		if (osq_optimistic_spin(&lock->osq, six_osq_get_owner,
+					six_osq_trylock_intent))
+			return;
+		break;
+	case SIX_LOCK_write:
+		break;
+	}
 
 	lock_contended(&lock->dep_map, _RET_IP_);
 

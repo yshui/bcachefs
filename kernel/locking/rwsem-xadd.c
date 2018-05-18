@@ -13,6 +13,7 @@
 #include <linux/rwsem.h>
 #include <linux/init.h>
 #include <linux/export.h>
+#include <linux/osq_optimistic_spin.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/rt.h>
 #include <linux/sched/wake_q.h>
@@ -325,11 +326,23 @@ static inline bool rwsem_try_write_lock(long count, struct rw_semaphore *sem)
 }
 
 #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+
+static inline struct task_struct *rwsem_osq_get_owner(struct optimistic_spin_queue *osq)
+{
+	struct rw_semaphore *sem = container_of(osq, struct rw_semaphore, osq);
+	struct task_struct *owner = READ_ONCE(sem->owner);
+
+	BUILD_BUG_ON(!rwsem_has_anonymous_owner(RWSEM_OWNER_UNKNOWN));
+
+	return is_rwsem_owner_spinnable(owner) ? owner : OWNER_NO_SPIN;
+}
+
 /*
  * Try to acquire write lock before the writer has been put on wait queue.
  */
-static inline bool rwsem_try_write_lock_unqueued(struct rw_semaphore *sem)
+static inline bool rwsem_osq_trylock(struct optimistic_spin_queue *osq)
 {
+	struct rw_semaphore *sem = container_of(osq, struct rw_semaphore, osq);
 	long old, count = atomic_long_read(&sem->count);
 
 	while (true) {
@@ -347,125 +360,10 @@ static inline bool rwsem_try_write_lock_unqueued(struct rw_semaphore *sem)
 	}
 }
 
-static inline bool owner_on_cpu(struct task_struct *owner)
-{
-	/*
-	 * As lock holder preemption issue, we both skip spinning if
-	 * task is not on cpu or its cpu is preempted
-	 */
-	return owner->on_cpu && !vcpu_is_preempted(task_cpu(owner));
-}
-
-static inline bool rwsem_can_spin_on_owner(struct rw_semaphore *sem)
-{
-	struct task_struct *owner;
-	bool ret = true;
-
-	BUILD_BUG_ON(!rwsem_has_anonymous_owner(RWSEM_OWNER_UNKNOWN));
-
-	if (need_resched())
-		return false;
-
-	rcu_read_lock();
-	owner = READ_ONCE(sem->owner);
-	if (owner) {
-		ret = is_rwsem_owner_spinnable(owner) &&
-		      owner_on_cpu(owner);
-	}
-	rcu_read_unlock();
-	return ret;
-}
-
-/*
- * Return true only if we can still spin on the owner field of the rwsem.
- */
-static noinline bool rwsem_spin_on_owner(struct rw_semaphore *sem)
-{
-	struct task_struct *owner = READ_ONCE(sem->owner);
-
-	if (!is_rwsem_owner_spinnable(owner))
-		return false;
-
-	rcu_read_lock();
-	while (owner && (READ_ONCE(sem->owner) == owner)) {
-		/*
-		 * Ensure we emit the owner->on_cpu, dereference _after_
-		 * checking sem->owner still matches owner, if that fails,
-		 * owner might point to free()d memory, if it still matches,
-		 * the rcu_read_lock() ensures the memory stays valid.
-		 */
-		barrier();
-
-		/*
-		 * abort spinning when need_resched or owner is not running or
-		 * owner's cpu is preempted.
-		 */
-		if (need_resched() || !owner_on_cpu(owner)) {
-			rcu_read_unlock();
-			return false;
-		}
-
-		cpu_relax();
-	}
-	rcu_read_unlock();
-
-	/*
-	 * If there is a new owner or the owner is not set, we continue
-	 * spinning.
-	 */
-	return is_rwsem_owner_spinnable(READ_ONCE(sem->owner));
-}
-
 static bool rwsem_optimistic_spin(struct rw_semaphore *sem)
 {
-	bool taken = false;
-
-	preempt_disable();
-
-	/* sem->wait_lock should not be held when doing optimistic spinning */
-	if (!rwsem_can_spin_on_owner(sem))
-		goto done;
-
-	if (!osq_lock(&sem->osq))
-		goto done;
-
-	/*
-	 * Optimistically spin on the owner field and attempt to acquire the
-	 * lock whenever the owner changes. Spinning will be stopped when:
-	 *  1) the owning writer isn't running; or
-	 *  2) readers own the lock as we can't determine if they are
-	 *     actively running or not.
-	 */
-	while (rwsem_spin_on_owner(sem)) {
-		/*
-		 * Try to acquire the lock
-		 */
-		if (rwsem_try_write_lock_unqueued(sem)) {
-			taken = true;
-			break;
-		}
-
-		/*
-		 * When there's no owner, we might have preempted between the
-		 * owner acquiring the lock and setting the owner field. If
-		 * we're an RT task that will live-lock because we won't let
-		 * the owner complete.
-		 */
-		if (!sem->owner && (need_resched() || rt_task(current)))
-			break;
-
-		/*
-		 * The cpu_relax() call is a compiler barrier which forces
-		 * everything in this loop to be re-loaded. We don't need
-		 * memory barriers as we'll eventually observe the right
-		 * values at the cost of a few extra spins.
-		 */
-		cpu_relax();
-	}
-	osq_unlock(&sem->osq);
-done:
-	preempt_enable();
-	return taken;
+	return osq_optimistic_spin(&sem->osq, rwsem_osq_get_owner,
+				   rwsem_osq_trylock);
 }
 
 /*
