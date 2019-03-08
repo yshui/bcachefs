@@ -62,10 +62,10 @@ struct btree_alloc {
 
 struct btree {
 	/* Hottest entries first */
+	struct six_lock		lock;
+
 	struct rhash_head	hash;
 	u64			hash_val;
-
-	struct six_lock		lock;
 
 	unsigned long		flags;
 	u16			written;
@@ -180,6 +180,7 @@ struct btree_node_iter {
 enum btree_iter_type {
 	BTREE_ITER_KEYS,
 	BTREE_ITER_NODES,
+	BTREE_ITER_CACHED,
 };
 
 #define BTREE_ITER_TYPE			((1 << 2) - 1)
@@ -211,6 +212,11 @@ enum btree_iter_type {
 #define BTREE_ITER_IS_EXTENTS		(1 << 6)
 #define BTREE_ITER_ERROR		(1 << 7)
 #define BTREE_ITER_SET_POS_AFTER_COMMIT	(1 << 8)
+#define BTREE_ITER_CACHED_NOFILL	(1 << 9)
+
+#define BTREE_ITER_USER_FLAGS				\
+	(BTREE_ITER_SLOTS|BTREE_ITER_INTENT|		\
+	 BTREE_ITER_CACHED_NOFILL|BTREE_ITER_PREFETCH)
 
 enum btree_iter_uptodate {
 	BTREE_ITER_UPTODATE		= 0,
@@ -256,7 +262,8 @@ struct btree_iter {
 	unsigned long		ip_allocated;
 };
 
-static inline enum btree_iter_type btree_iter_type(struct btree_iter *iter)
+static inline enum btree_iter_type
+btree_iter_type(const struct btree_iter *iter)
 {
 	return iter->flags & BTREE_ITER_TYPE;
 }
@@ -265,6 +272,35 @@ static inline struct btree_iter_level *iter_l(struct btree_iter *iter)
 {
 	return iter->l + iter->level;
 }
+
+struct btree_key_cache {
+	struct mutex		lock;
+	struct rhashtable	table;
+	struct list_head	freed;
+	struct list_head	clean;
+};
+
+struct bkey_cached_key {
+	u8			btree_id;
+	struct bpos		pos;
+} __packed;
+
+#define BKEY_CACHED_DIRTY		0
+
+struct bkey_cached {
+	struct six_lock		lock;
+	unsigned long		flags;
+	u8			u64s;
+	struct bkey_cached_key	key;
+
+	struct rhash_head	hash;
+	struct list_head	list;
+
+	struct journal_preres	res;
+	struct journal_entry_pin journal;
+
+	struct bkey_i		*k;
+};
 
 struct btree_insert_entry {
 	unsigned		trigger_flags;

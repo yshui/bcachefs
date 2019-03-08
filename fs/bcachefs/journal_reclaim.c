@@ -354,6 +354,30 @@ void __bch2_journal_pin_add(struct journal *j, u64 seq,
 	journal_wake(j);
 }
 
+void bch2_journal_pin_update(struct journal *j, u64 seq,
+			     struct journal_entry_pin *pin,
+			     journal_pin_flush_fn flush_fn)
+{
+	spin_lock(&j->lock);
+
+	if (pin->seq != seq) {
+		bch2_journal_pin_add_locked(j, seq, pin, flush_fn);
+	} else {
+		struct journal_entry_pin_list *pin_list =
+			journal_seq_pin(j, seq);
+
+		list_move(&pin->list, &pin_list->list);
+	}
+
+	spin_unlock(&j->lock);
+
+	/*
+	 * If the journal is currently full,  we might want to call flush_fn
+	 * immediately:
+	 */
+	journal_wake(j);
+}
+
 void bch2_journal_pin_copy(struct journal *j,
 			   struct journal_entry_pin *dst,
 			   struct journal_entry_pin *src,

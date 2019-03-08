@@ -168,21 +168,25 @@ struct bkey_s_c bch2_btree_iter_prev(struct btree_iter *);
 struct bkey_s_c bch2_btree_iter_peek_slot(struct btree_iter *);
 struct bkey_s_c bch2_btree_iter_next_slot(struct btree_iter *);
 
+struct bkey_s_c bch2_btree_iter_peek_cached(struct btree_iter *);
+
 void bch2_btree_iter_set_pos_same_leaf(struct btree_iter *, struct bpos);
 void __bch2_btree_iter_set_pos(struct btree_iter *, struct bpos, bool);
 void bch2_btree_iter_set_pos(struct btree_iter *, struct bpos);
 
-static inline int __btree_iter_cmp(enum btree_id id,
+static inline int __btree_iter_cmp(const struct btree_iter *l,
 				   struct bpos pos,
 				   const struct btree_iter *r)
 {
-	return cmp_int(id, r->btree_id) ?: bkey_cmp(pos, r->pos);
+	return   cmp_int(l->btree_id, r->btree_id) ?:
+		-cmp_int(btree_iter_type(l), btree_iter_type(r)) ?:
+		 bkey_cmp(pos, r->pos);
 }
 
 static inline int btree_iter_cmp(const struct btree_iter *l,
 				 const struct btree_iter *r)
 {
-	return __btree_iter_cmp(l->btree_id, l->pos, r);
+	return __btree_iter_cmp(l, l->pos, r);
 }
 
 /*
@@ -216,9 +220,12 @@ static inline int bch2_trans_cond_resched(struct btree_trans *trans)
 static inline struct bkey_s_c __bch2_btree_iter_peek(struct btree_iter *iter,
 						     unsigned flags)
 {
-	return flags & BTREE_ITER_SLOTS
-		? bch2_btree_iter_peek_slot(iter)
-		: bch2_btree_iter_peek(iter);
+	if ((flags & BTREE_ITER_TYPE) == BTREE_ITER_CACHED)
+		return bch2_btree_iter_peek_cached(iter);
+	else
+		return flags & BTREE_ITER_SLOTS
+			? bch2_btree_iter_peek_slot(iter)
+			: bch2_btree_iter_peek(iter);
 }
 
 static inline struct bkey_s_c __bch2_btree_iter_next(struct btree_iter *iter,
