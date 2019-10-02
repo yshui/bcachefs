@@ -143,10 +143,7 @@ retry:
 				  BTREE_INSERT_NOUNLOCK|
 				  BTREE_INSERT_NOFAIL);
 
-	/*
-	 * the btree node lock protects inode->ei_inode, not ei_update_lock;
-	 * this is important for inode updates via bchfs_write_index_update
-	 */
+	/* the btree node lock protects inode->ei_inode: */
 	if (!ret)
 		bch2_inode_update_after_write(c, inode, &inode_u, fields);
 
@@ -167,6 +164,8 @@ int bch2_fs_quota_transfer(struct bch_fs *c,
 {
 	unsigned i;
 	int ret;
+
+	lockdep_assert_held(&inode->v.i_rwsem);
 
 	qtypes &= enabled_qtypes(c);
 
@@ -252,9 +251,6 @@ __bch2_create(struct bch_inode_info *dir, struct dentry *dentry,
 
 	bch2_inode_init_early(c, &inode_u);
 
-	if (!tmpfile)
-		mutex_lock(&dir->ei_update_lock);
-
 	bch2_trans_init(&trans, c, 8, 1024);
 retry:
 	bch2_trans_begin(&trans);
@@ -285,12 +281,12 @@ err_before_quota:
 		bch2_inode_update_after_write(c, dir, &dir_u,
 					      ATTR_MTIME|ATTR_CTIME);
 		journal_seq_copy(dir, journal_seq);
-		mutex_unlock(&dir->ei_update_lock);
 	}
 
 	bch2_vfs_inode_init(c, inode, &inode_u);
 	journal_seq_copy(inode, journal_seq);
 
+	/* under btree lock: */
 	set_cached_acl(&inode->v, ACL_TYPE_ACCESS, acl);
 	set_cached_acl(&inode->v, ACL_TYPE_DEFAULT, default_acl);
 
@@ -325,9 +321,6 @@ err:
 	posix_acl_release(acl);
 	return inode;
 err_trans:
-	if (!tmpfile)
-		mutex_unlock(&dir->ei_update_lock);
-
 	bch2_trans_exit(&trans);
 	make_bad_inode(&inode->v);
 	iput(&inode->v);
@@ -382,7 +375,6 @@ static int __bch2_link(struct bch_fs *c,
 	struct bch_inode_unpacked dir_u, inode_u;
 	int ret;
 
-	mutex_lock(&inode->ei_update_lock);
 	bch2_trans_init(&trans, c, 4, 1024);
 
 	do {
@@ -406,7 +398,6 @@ static int __bch2_link(struct bch_fs *c,
 	}
 
 	bch2_trans_exit(&trans);
-	mutex_unlock(&inode->ei_update_lock);
 	return ret;
 }
 
@@ -438,7 +429,6 @@ static int bch2_unlink(struct inode *vdir, struct dentry *dentry)
 	struct btree_trans trans;
 	int ret;
 
-	bch2_lock_inodes(INODE_UPDATE_LOCK, dir, inode);
 	bch2_trans_init(&trans, c, 4, 1024);
 
 	do {
@@ -464,7 +454,6 @@ static int bch2_unlink(struct inode *vdir, struct dentry *dentry)
 	}
 
 	bch2_trans_exit(&trans);
-	bch2_unlock_inodes(INODE_UPDATE_LOCK, dir, inode);
 
 	return ret;
 }
@@ -540,12 +529,6 @@ static int bch2_rename2(struct inode *src_vdir, struct dentry *src_dentry,
 
 	bch2_trans_init(&trans, c, 8, 2048);
 
-	bch2_lock_inodes(INODE_UPDATE_LOCK,
-			 src_dir,
-			 dst_dir,
-			 src_inode,
-			 dst_inode);
-
 	if (inode_attr_changing(dst_dir, src_inode, Inode_opt_project)) {
 		ret = bch2_fs_quota_transfer(c, src_inode,
 					     dst_dir->ei_qid,
@@ -619,12 +602,6 @@ err:
 				       1 << QTYP_PRJ,
 				       KEY_TYPE_QUOTA_NOCHECK);
 
-	bch2_unlock_inodes(INODE_UPDATE_LOCK,
-			   src_dir,
-			   dst_dir,
-			   src_inode,
-			   dst_inode);
-
 	return ret;
 }
 
@@ -671,8 +648,6 @@ static int bch2_setattr_nonsize(struct bch_inode_info *inode,
 	struct posix_acl *acl = NULL;
 	int ret;
 
-	mutex_lock(&inode->ei_update_lock);
-
 	qid = inode->ei_qid;
 
 	if (attr->ia_valid & ATTR_UID)
@@ -684,7 +659,7 @@ static int bch2_setattr_nonsize(struct bch_inode_info *inode,
 	ret = bch2_fs_quota_transfer(c, inode, qid, ~0,
 				     KEY_TYPE_QUOTA_PREALLOC);
 	if (ret)
-		goto err;
+		return ret;
 
 	bch2_trans_init(&trans, c, 0, 0);
 retry:
@@ -715,17 +690,15 @@ btree_err:
 	if (ret == -EINTR)
 		goto retry;
 	if (unlikely(ret))
-		goto err_trans;
+		goto err;
 
 	bch2_inode_update_after_write(c, inode, &inode_u, attr->ia_valid);
 
+	/* under btree lock: */
 	if (acl)
 		set_cached_acl(&inode->v, ACL_TYPE_ACCESS, acl);
-err_trans:
-	bch2_trans_exit(&trans);
 err:
-	mutex_unlock(&inode->ei_update_lock);
-
+	bch2_trans_exit(&trans);
 	return ret;
 }
 
@@ -1153,7 +1126,6 @@ static struct inode *bch2_alloc_inode(struct super_block *sb)
 		return NULL;
 
 	inode_init_once(&inode->v);
-	mutex_init(&inode->ei_update_lock);
 	pagecache_lock_init(&inode->ei_pagecache_lock);
 	mutex_init(&inode->ei_quota_lock);
 	inode->ei_journal_seq = 0;
@@ -1192,14 +1164,9 @@ static int bch2_vfs_write_inode(struct inode *vinode,
 {
 	struct bch_fs *c = vinode->i_sb->s_fs_info;
 	struct bch_inode_info *inode = to_bch_ei(vinode);
-	int ret;
 
-	mutex_lock(&inode->ei_update_lock);
-	ret = bch2_write_inode(c, inode, inode_update_times_fn, NULL,
-			       ATTR_ATIME|ATTR_MTIME|ATTR_CTIME);
-	mutex_unlock(&inode->ei_update_lock);
-
-	return ret;
+	return bch2_write_inode(c, inode, inode_update_times_fn, NULL,
+				ATTR_ATIME|ATTR_MTIME|ATTR_CTIME);
 }
 
 static void bch2_evict_inode(struct inode *vinode)
