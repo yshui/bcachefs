@@ -280,6 +280,8 @@ static void req_bio_endio(struct request *rq, struct bio *bio,
 
 void blk_dump_rq_flags(struct request *rq, char *msg)
 {
+	struct bio *bio;
+
 	printk(KERN_INFO "%s: dev %s: flags=%llx\n", msg,
 		rq->rq_disk ? rq->rq_disk->disk_name : "?",
 		(unsigned long long) rq->cmd_flags);
@@ -289,6 +291,14 @@ void blk_dump_rq_flags(struct request *rq, char *msg)
 	       blk_rq_sectors(rq), blk_rq_cur_sectors(rq));
 	printk(KERN_INFO "  bio %p, biotail %p, len %u\n",
 	       rq->bio, rq->biotail, blk_rq_bytes(rq));
+
+	printk(KERN_INFO "  rq %p\n", rq->end_io);
+
+	__rq_for_each_bio(bio, rq)
+		printk(KERN_INFO "  bio %pf cur %u total %u\n",
+		       bio->bi_end_io,
+		       bio_cur_bytes(bio),
+		       bio->bi_iter.bi_size);
 }
 EXPORT_SYMBOL(blk_dump_rq_flags);
 
